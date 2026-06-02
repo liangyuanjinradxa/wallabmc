@@ -1,0 +1,8 @@
+=== updating zephyr (zephyr):
+--- zephyr: fetching, need revision v4.4.0
+error: RPC 失败。curl 56 GnuTLS recv error (-9): Error decoding the received TLS packet.
+error: 预期仍然需要 4657 个字节的正文
+fetch-pack: unexpected disconnect while reading sideband packet
+fatal: 过早的文件结束符（EOF）
+fatal: fetch-pack：无效的 index-pack 输出
+FATAL ERROR: command exited with status 128: fetch -f --tags -- https://github.com/zephyrproject-rtos/zephyr v4.4.0

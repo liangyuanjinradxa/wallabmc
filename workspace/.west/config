@@ -1,0 +1,7 @@
+[manifest]
+path = wallabmc
+file = west.yml
+
+[zephyr]
+base = zephyr
+

@@ -534,6 +534,7 @@
 					<a class="sidebar-item" data-section="host-console" href="#" onclick="showSection('host-console'); return false;">Host Console</a>
 					<a class="sidebar-item" data-section="bmc" href="#" onclick="showSection('bmc'); return false;">BMC Settings</a>
 					<a class="sidebar-item" data-section="bmc-shell" href="#" onclick="showSection('bmc-shell'); return false;">BMC Shell</a>
+					<a class="sidebar-item" data-section="firmware" href="#" onclick="showSection('firmware'); return false;">Firmware Update</a>
 					<a id="sidebar-sensors" class="sidebar-item hidden" data-section="sensors" href="#" onclick="showSection('sensors'); return false;">Sensors</a>
 				</nav>
 				<div class="dashboard-content">
@@ -708,6 +709,42 @@
 							<div class="controls-grid">
 								<button class="danger" onclick="saveBmcConfig()">Apply Changes</button>
 								<button onclick="refreshConfigData()">Discard Changes</button>
+							</div>
+						</div>
+					</div>
+
+					<div id="section-firmware" class="hidden">
+						<div class="card">
+							<h2>Firmware Update</h2>
+
+							<div id="fw-status-area">
+								<div class="info-item" style="margin-bottom: 15px;">
+									<span class="info-item-label">Status</span>
+									<span class="data-value" id="fw-status" style="font-weight: bold;">Idle</span>
+								</div>
+								<div id="fw-progress-area" class="hidden" style="margin-bottom: 15px;">
+									<div class="info-item">
+										<span class="info-item-label">Progress</span>
+										<progress id="fw-progress-bar" value="0" max="100" style="width: 100%; height: 20px;"></progress>
+										<span class="data-value" id="fw-progress-text">0 / 0 bytes</span>
+									</div>
+								</div>
+							</div>
+
+							<div id="fw-upload-area">
+								<div class="grid-4-col">
+									<div class="info-item">
+										<label for="fw-file">Select Firmware File</label>
+										<input type="file" id="fw-file" accept=".bin,.hex" onchange="onFirmwareFileSelected()">
+										<span class="helper-text" id="fw-file-info">No file selected</span>
+									</div>
+								</div>
+								<div class="controls-grid" style="margin-top: 20px;">
+									<button id="fw-upload-btn" onclick="startFirmwareUpload()" disabled>Upload Firmware</button>
+									<button id="fw-commit-btn" class="danger hidden" onclick="commitFirmware()">Apply &amp; Reboot</button>
+									<button id="fw-cancel-btn" class="grey" onclick="cancelFirmwareUpdate()">Cancel</button>
+								</div>
+								<div id="fw-upload-msg" style="margin-top: 15px; font-weight: bold;" class="hidden"></div>
 							</div>
 						</div>
 					</div>
@@ -1280,7 +1317,7 @@
 		});
 
 		// --- Sidebar navigation ---
-		const SECTIONS = ['system-overview', 'host-console', 'bmc-shell', 'power-control', 'bmc', 'sensors'];
+		const SECTIONS = ['system-overview', 'host-console', 'bmc-shell', 'power-control', 'bmc', 'firmware', 'sensors'];
 
 		function toggleSidebar() {
 			const sidebar = document.querySelector('.sidebar');
@@ -1498,6 +1535,135 @@
 				}
 				document.getElementById('bmc-terminal-container').innerHTML = '';
 			}
+		}
+
+		// --- Firmware Update ---
+		let fwFile = null;
+		let fwUploadInProgress = false;
+
+		async function fwApi(method, path, body) {
+			return redfishCall(path, method, body);
+		}
+
+		function onFirmwareFileSelected() {
+			fwFile = document.getElementById('fw-file').files[0];
+			const btn = document.getElementById('fw-upload-btn');
+			const info = document.getElementById('fw-file-info');
+			if (fwFile) {
+				btn.disabled = false;
+				info.innerText = `${fwFile.name} (${(fwFile.size / 1024).toFixed(1)} KB)`;
+			} else {
+				btn.disabled = true;
+				info.innerText = 'No file selected';
+			}
+		}
+
+		async function startFirmwareUpload() {
+			if (!fwFile || fwUploadInProgress) return;
+
+			fwUploadInProgress = true;
+			const btn = document.getElementById('fw-upload-btn');
+			const msg = document.getElementById('fw-upload-msg');
+			const progress = document.getElementById('fw-progress-area');
+			btn.disabled = true;
+			btn.innerText = 'Uploading...';
+			msg.classList.add('hidden');
+			msg.innerText = '';
+
+			try {
+				// Step 1: Start firmware update (erase slot1)
+				await redfishCall('/api/firmware/start', 'POST', { Size: fwFile.size });
+				setText('fw-status', 'Erasing...');
+				progress.classList.remove('hidden');
+
+				// Step 2: Upload firmware binary in 8KB chunks
+				// Zephyr v4.4.0 HTTP server does NOT support chunked body delivery,
+				// so each chunk must be a separate POST request.
+				setText('fw-status', 'Uploading...');
+				const uploadUrl = '/api/firmware/upload';
+				const CHUNK_SIZE = 8192;
+				let offset = 0;
+				const total = fwFile.size;
+
+				while (offset < total) {
+					const end = Math.min(offset + CHUNK_SIZE, total);
+					const chunk = fwFile.slice(offset, end);
+					const resp = await fetch(uploadUrl, {
+						method: 'POST',
+						headers: {
+							'authorization': basicAuthHeader,
+							'content-type': 'application/octet-stream',
+							'x-auth-code': 'webui',
+						},
+						body: chunk,
+					});
+					if (!resp.ok) {
+						throw new Error(`Upload failed at ${offset}: ${resp.status}`);
+					}
+					offset = end;
+
+					// Update progress bar
+					const pct = Math.round(offset * 100 / total);
+					document.getElementById('fw-progress-bar').value = pct;
+					document.getElementById('fw-progress-text').innerText =
+						`${offset} / ${total} bytes (${pct}%)`;
+				}
+
+				setText('fw-status', 'Upload complete');
+				document.getElementById('fw-progress-bar').value = 100;
+				document.getElementById('fw-progress-text').innerText =
+					`${fwFile.size} / ${fwFile.size} bytes`;
+
+				// Show commit button
+				document.getElementById('fw-commit-btn').classList.remove('hidden');
+				msg.classList.remove('hidden');
+				msg.style.color = 'green';
+				msg.innerText = 'Upload successful! Click "Apply & Reboot" to activate.';
+
+			} catch (err) {
+				msg.classList.remove('hidden');
+				msg.style.color = 'red';
+				msg.innerText = 'Error: ' + err.message;
+				setText('fw-status', 'Error');
+				btn.disabled = false;
+				btn.innerText = 'Retry Upload';
+			} finally {
+				fwUploadInProgress = false;
+			}
+		}
+
+		async function commitFirmware() {
+			if (!confirm('Apply firmware update and reboot the BMC?')) return;
+
+			try {
+				setText('fw-status', 'Committing...');
+				await redfishCall('/api/firmware/commit', 'POST');
+				setText('fw-status', 'Rebooting...');
+				document.getElementById('fw-commit-btn').disabled = true;
+				setTimeout(() => {
+					setText('fw-status', 'BMC is rebooting...');
+				}, 3000);
+			} catch (err) {
+				const msg = document.getElementById('fw-upload-msg');
+				msg.classList.remove('hidden');
+				msg.style.color = 'red';
+				msg.innerText = 'Commit failed: ' + err.message;
+			}
+		}
+
+		async function cancelFirmwareUpdate() {
+			try {
+				await redfishCall('/api/firmware/start', 'POST', { Size: 0 });
+			} catch (e) { /* ignore */ }
+			setText('fw-status', 'Idle');
+			document.getElementById('fw-progress-area').classList.add('hidden');
+			document.getElementById('fw-commit-btn').classList.add('hidden');
+			document.getElementById('fw-upload-btn').disabled = false;
+			document.getElementById('fw-upload-btn').innerText = 'Upload Firmware';
+			document.getElementById('fw-upload-msg').classList.add('hidden');
+			fwFile = null;
+			document.getElementById('fw-file').value = '';
+			document.getElementById('fw-file-info').innerText = 'No file selected';
 		}
 
 		populateFontSelects();

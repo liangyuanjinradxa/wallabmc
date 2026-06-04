@@ -26,6 +26,9 @@ LOG_MODULE_REGISTER(wallabmc, LOG_LEVEL_INF);
 #include "console_bridge_ws.h"
 #include "vpd.h"
 #include "git_sha.h"
+#ifdef CONFIG_APP_FW_UPDATE
+#include "fw_update.h"
+#endif
 
 static bool boot_finished = false;
 
@@ -259,6 +262,18 @@ int main(void)
 		LOG_ERR("HTTP server init failed");
 		return -1;
 	}
+
+#ifdef CONFIG_APP_FW_UPDATE
+	LOG_DBG("Firmware update init");
+	if (fw_update_init() < 0) {
+		LOG_ERR("Firmware update init failed");
+		/* Continue without firmware update */
+	}
+
+	if (fw_update_init_redfish() < 0) {
+		LOG_ERR("Firmware update Redfish init failed");
+	}
+#endif
 
 	LOG_DBG("Console logger init");
 	if (console_logger_init() < 0) {

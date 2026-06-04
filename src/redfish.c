@@ -30,6 +30,9 @@
 #include "sensors.h"
 #include "vpd.h"
 #include "git_sha.h"
+#ifdef CONFIG_APP_FW_UPDATE
+#include "fw_update.h"
+#endif
 
 LOG_MODULE_REGISTER(redfish_app, CONFIG_LOG_DEFAULT_LEVEL);
 
@@ -184,9 +187,9 @@ struct http_resource_user_data {
 	uint8_t *data_buffer;
 };
 
-#define USER_DATA_HEAP_SIZE		2048
+#define USER_DATA_HEAP_SIZE		16384
 #define USER_DATA_BUFFER_GET_SIZE	1024
-#define USER_DATA_BUFFER_POST_SIZE	512
+#define USER_DATA_BUFFER_POST_SIZE	4096
 
 static K_HEAP_DEFINE(heap_data_buffer, USER_DATA_HEAP_SIZE);
 
@@ -1744,6 +1747,198 @@ REDFISH_HANDLER(sensor_temp_bmc, "/redfish/v1/Chassis/1/Sensors/TempBmc",
 		true, /* require auth */
 		sensor_temp_bmc_get_handler, NULL, NULL);
 #endif /* CONFIG_APP_SENSORS */
+
+#ifdef CONFIG_APP_FW_UPDATE
+
+/*
+ * Firmware upload buffer (dedicated, not shared with other HTTP handlers).
+ * Must be large enough to hold one firmware upload chunk.
+ * Zephyr HTTP server delivers the entire POST body at once.
+ * Allocate 64KB — firmware is typically 420KB, uploaded in ~7 chunks.
+ */
+#define FW_WRITE_BUF_SIZE 65536
+static uint8_t __aligned(8) fw_write_buf[FW_WRITE_BUF_SIZE];
+static K_HEAP_DEFINE(fw_write_heap, FW_WRITE_BUF_SIZE);
+
+/* ---- /api/firmware/status (uses REDFISH_HANDLER) ---- */
+
+static int fw_status_get_handler(struct http_resource_user_data *user_data)
+{
+	enum fw_update_state s = fw_update_get_state();
+	const char *status_str;
+
+	switch (s) {
+	case FW_UPDATE_IDLE:        status_str = "Idle"; break;
+	case FW_UPDATE_ERASING:     status_str = "Erasing"; break;
+	case FW_UPDATE_IN_PROGRESS: status_str = "InProgress"; break;
+	case FW_UPDATE_COMPLETE:    status_str = "Complete"; break;
+	case FW_UPDATE_ERROR:       status_str = "Error"; break;
+	default:                    status_str = "Unknown"; break;
+	}
+
+	char buf[128];
+	int n = snprintf(buf, sizeof(buf),
+		"{\"Status\":\"%s\",\"BytesWritten\":%zu}",
+		status_str, fw_update_bytes_written());
+	memcpy(user_data->data_buffer, buf, n + 1);
+	user_data->data_len = n;
+	return 0;
+}
+
+REDFISH_HANDLER(fw_status, "/api/firmware/status",
+		true, /* require auth */
+		fw_status_get_handler, NULL, NULL);
+
+/* ---- /api/firmware/start (uses REDFISH_HANDLER) ---- */
+
+static int fw_start_post_handler(struct http_resource_user_data *user_data)
+{
+	const char *body = (const char *)user_data->data_buffer;
+	size_t len = user_data->data_len;
+	const char *p = body;
+	const char *end = body + len;
+	size_t total_size = 0;
+
+	while (p < end) {
+		if (*p == '"' && end - p > 6 && memcmp(p, "\"Size\"", 6) == 0) {
+			p += 6;
+			while (p < end && *p != ':') p++;
+			if (p < end) p++;
+			while (p < end && (*p == ' ' || *p == '\t')) p++;
+			while (p < end && *p >= '0' && *p <= '9') {
+				total_size = total_size * 10 + (*p - '0');
+				p++;
+			}
+			break;
+		}
+		p++;
+	}
+
+	if (total_size == 0) {
+		LOG_ERR("FW start: missing or zero Size");
+		return HTTP_400_BAD_REQUEST;
+	}
+
+	LOG_INF("FW start: total size=%zu", total_size);
+	int rc = fw_update_start(total_size);
+	if (rc < 0) {
+		LOG_ERR("FW start failed (err=%d)", rc);
+		return HTTP_500_INTERNAL_SERVER_ERROR;
+	}
+
+	return 0;
+}
+
+REDFISH_HANDLER(fw_start, "/api/firmware/start",
+		true, /* require auth */
+		NULL, NULL, fw_start_post_handler);
+
+/* ---- /api/firmware/write (custom handler, handles chunked POST) ---- */
+
+
+static int fw_write_handler(struct http_client_ctx *client,
+			    enum http_transaction_status status,
+			    const struct http_request_ctx *request_ctx,
+			    struct http_response_ctx *response_ctx,
+			    void *user_data)
+{
+	ARG_UNUSED(user_data);
+
+	if (status == HTTP_SERVER_TRANSACTION_COMPLETE ||
+	    status == HTTP_SERVER_TRANSACTION_ABORTED) {
+		return 0;
+	}
+
+	if (client->method != HTTP_POST) {
+		response_ctx->status = HTTP_405_METHOD_NOT_ALLOWED;
+		response_ctx->final_chunk = true;
+		return 0;
+	}
+
+	/* Write each chunk of the POST body to flash.
+	 * Status is HTTP_SERVER_REQUEST_DATA_MORE for intermediate chunks
+	 * and HTTP_SERVER_REQUEST_DATA_FINAL for the last chunk.
+	 */
+	if (request_ctx->data && request_ctx->data_len > 0) {
+		size_t len = request_ctx->data_len;
+
+		memcpy(fw_write_buf, request_ctx->data, len);
+		k_yield();
+
+		int rc = fw_update_write(fw_write_buf, len);
+		if (rc < 0) {
+			LOG_ERR("FW write failed at offset %zu (err=%d)",
+				fw_update_bytes_written(), rc);
+			response_ctx->status = HTTP_500_INTERNAL_SERVER_ERROR;
+			response_ctx->final_chunk = true;
+			return 0;
+		}
+	}
+
+	/* Send response only after all data is received */
+	if (status == HTTP_SERVER_REQUEST_DATA_FINAL) {
+		response_ctx->status = HTTP_204_NO_CONTENT;
+		response_ctx->final_chunk = true;
+	}
+
+	return 0;
+}
+
+static const struct http_resource_detail_dynamic fw_write_detail = {
+	.common = {
+		.type = HTTP_RESOURCE_TYPE_DYNAMIC,
+		.bitmask_of_supported_http_methods = BIT(HTTP_POST),
+	},
+	.cb = fw_write_handler,
+	.user_data = NULL,
+};
+
+#if defined(CONFIG_APP_HTTPS)
+HTTP_RESOURCE_DEFINE(fw_write_http, http_service,
+	"/api/firmware/upload", &fw_write_detail);
+HTTP_RESOURCE_DEFINE(fw_write_https, https_service,
+	"/api/firmware/upload", &fw_write_detail);
+#else
+HTTP_RESOURCE_DEFINE(fw_write_http, http_service,
+	"/api/firmware/upload", &fw_write_detail);
+#endif
+
+/* ---- /api/firmware/commit (uses REDFISH_HANDLER) ---- */
+
+static struct k_work_delayable fw_reboot_work;
+
+static void fw_reboot_work_fn(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	fw_update_apply_and_reboot();
+}
+
+static int fw_commit_post_handler(struct http_resource_user_data *user_data)
+{
+	ARG_UNUSED(user_data);
+	LOG_INF("FW commit: finishing update");
+	int rc = fw_update_finish();
+	if (rc < 0) {
+		LOG_ERR("FW commit failed (err=%d)", rc);
+		return HTTP_500_INTERNAL_SERVER_ERROR;
+	}
+
+	LOG_INF("FW commit: rebooting in 2 seconds...");
+	k_work_schedule(&fw_reboot_work, K_SECONDS(2));
+	return 0;
+}
+
+REDFISH_HANDLER(fw_commit, "/api/firmware/commit",
+		true, /* require auth */
+		NULL, NULL, fw_commit_post_handler);
+
+int fw_update_init_redfish(void)
+{
+	k_work_init_delayable(&fw_reboot_work, fw_reboot_work_fn);
+	return 0;
+}
+
+#endif /* CONFIG_APP_FW_UPDATE */
 
 /*** /redfish/v1/$metadata ***/
 static const uint8_t redfish_metadata_xml_gz[] = {

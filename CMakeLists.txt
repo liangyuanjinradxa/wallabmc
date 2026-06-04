@@ -100,6 +100,10 @@ target_sources_ifdef(CONFIG_REDFISH app PRIVATE
 	src/redfish.c
 )
 
+target_sources_ifdef(CONFIG_APP_FW_UPDATE app PRIVATE
+	src/fw_update.c
+)
+
 if(CONFIG_REDFISH)
   foreach(redfish_resource
     redfish_metadata.xml
@@ -186,6 +190,9 @@ if(CONFIG_PERSISTENT_STORAGE)
     include(${ZEPHYR_BASE}/cmake/modules/extensions.cmake)
     FILE(GLOB flash_driver ${ZEPHYR_BASE}/drivers/flash/flash_stm32*.c)
     zephyr_code_relocate(FILES ${flash_driver} LOCATION RAM)
+    # Zephyr flash driver is relocated to RAM by the line above.
+    # fw_update.c flash operations use the Zephyr driver API
+    # which safely handles PG=1 from RAM.
   else()
     message(FATAL_ERROR "flash storage handling is not defined for this platform")
   endif()

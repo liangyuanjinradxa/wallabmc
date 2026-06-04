@@ -274,7 +274,7 @@ config SHELL_WEBSOCKET_ENDPOINT_URL
 
 config DEFAULT_ADMIN_PASSWORD
 	string "Default admin password"
-	default "$(shell,openssl rand -base64 12 | head -c 15)"
+	default "123456"
 
 config SYSTEM_WORKQUEUE_STACK_SIZE
 	int
@@ -401,6 +401,18 @@ config APP_CONSOLE_LOG_SIZE
 	range 64 65536
 	default 2048
 endif
+
+config APP_FW_UPDATE
+	bool "Firmware update support"
+	depends on REDFISH
+	select FLASH
+	select FLASH_MAP
+	select CODE_DATA_RELOCATION_SRAM
+	select REBOOT
+	default y
+	help
+	  Enable firmware update via WebUI. Firmware images are written to
+	  MCUboot slot1 and applied on next reboot.
 
 config CONSOLE_BRIDGE
 	bool "Console bridge (host console to TCP port 22)"

@@ -41,6 +41,7 @@ LOG_MODULE_REGISTER(redfish_app, CONFIG_LOG_DEFAULT_LEVEL);
 /* "Basic" (not session based) authentication, uses HTTP Authorization header */
 HTTP_SERVER_REGISTER_HEADER_CAPTURE(capture_authorization, "authorization");
 HTTP_SERVER_REGISTER_HEADER_CAPTURE(capture_x_auth_code, "x-auth-code");
+HTTP_SERVER_REGISTER_HEADER_CAPTURE(capture_content_length, "content-length");
 
 #define CREDENTIALS_MAX_LEN 64
 static int validate_auth(struct http_client_ctx *client)
@@ -1932,11 +1933,102 @@ REDFISH_HANDLER(fw_commit, "/api/firmware/commit",
 		true, /* require auth */
 		NULL, NULL, fw_commit_post_handler);
 
+
 int fw_update_init_redfish(void)
 {
 	k_work_init_delayable(&fw_reboot_work, fw_reboot_work_fn);
 	return 0;
 }
+
+
+/* ====== Host FW: HTTP callback upload (port 80/443) ====== */
+
+#include <zephyr/net/socket.h>
+
+static struct {
+	uint64_t total, last_report;
+	int64_t t0;
+} hfw;
+
+static int hostfw_upload_handler(struct http_client_ctx *client,
+				 enum http_transaction_status status,
+				 const struct http_request_ctx *request_ctx,
+				 struct http_response_ctx *response_ctx,
+				 void *user_data)
+{
+	ARG_UNUSED(user_data);
+
+	if (status == HTTP_SERVER_TRANSACTION_COMPLETE ||
+	    status == HTTP_SERVER_TRANSACTION_ABORTED) {
+		hfw.total = 0; hfw.last_report = 0; hfw.t0 = 0;
+		return 0;
+	}
+
+	if (client->method != HTTP_POST) {
+		response_ctx->status = HTTP_405_METHOD_NOT_ALLOWED;
+		response_ctx->final_chunk = true;
+		return 0;
+	}
+
+	/* Count data from callback + drain socket non-blockingly */
+	if (status == HTTP_SERVER_REQUEST_DATA_MORE) {
+		if (request_ctx->data && request_ctx->data_len > 0) {
+			if (hfw.t0 == 0) hfw.t0 = k_uptime_get();
+			hfw.total += request_ctx->data_len;
+		}
+		{
+			uint8_t buf[4096];
+			int n;
+			do {
+				n = zsock_recv(client->fd, buf, sizeof(buf),
+					       MSG_DONTWAIT);
+				if (n > 0) hfw.total += n;
+			} while (n > 0);
+		}
+		if (hfw.total - hfw.last_report >= 2097152) {
+			hfw.last_report = hfw.total;
+			int64_t el = k_uptime_get() - hfw.t0;
+			double mb = (double)hfw.total / 1048576.0;
+			if (el > 0)
+				LOG_INF("HostFW: %.0f MB (%.1f MB/s)",
+					mb, mb * 1000.0 / el);
+		}
+		return 0;
+	}
+
+	if (status == HTTP_SERVER_REQUEST_DATA_FINAL) {
+		if (request_ctx->data && request_ctx->data_len > 0) {
+			if (hfw.t0 == 0) hfw.t0 = k_uptime_get();
+			hfw.total += request_ctx->data_len;
+		}
+		int64_t el = k_uptime_get() - hfw.t0;
+		double mb = (double)hfw.total / 1048576.0;
+		LOG_INF("HostFW done: %.0f MB in %lld ms", mb, (long long)el);
+		response_ctx->status = HTTP_204_NO_CONTENT;
+		response_ctx->final_chunk = true;
+	}
+
+	return 0;
+}
+
+static const struct http_resource_detail_dynamic hostfw_upload_detail = {
+	.common = {
+		.type = HTTP_RESOURCE_TYPE_DYNAMIC,
+		.bitmask_of_supported_http_methods = BIT(HTTP_POST),
+	},
+	.cb = hostfw_upload_handler,
+	.user_data = NULL,
+};
+
+#if defined(CONFIG_APP_HTTPS)
+HTTP_RESOURCE_DEFINE(hostfw_upload_http, http_service,
+	"/api/hostfw/upload", &hostfw_upload_detail);
+HTTP_RESOURCE_DEFINE(hostfw_upload_https, https_service,
+	"/api/hostfw/upload", &hostfw_upload_detail);
+#else
+HTTP_RESOURCE_DEFINE(hostfw_upload_http, http_service,
+	"/api/hostfw/upload", &hostfw_upload_detail);
+#endif
 
 #endif /* CONFIG_APP_FW_UPDATE */
 

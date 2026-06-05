@@ -535,6 +535,7 @@
 					<a class="sidebar-item" data-section="bmc" href="#" onclick="showSection('bmc'); return false;">BMC Settings</a>
 					<a class="sidebar-item" data-section="bmc-shell" href="#" onclick="showSection('bmc-shell'); return false;">BMC Shell</a>
 					<a class="sidebar-item" data-section="firmware" href="#" onclick="showSection('firmware'); return false;">Firmware Update</a>
+					<a class="sidebar-item" data-section="hostfw" href="#" onclick="showSection('hostfw'); return false;">Host Flash Update</a>
 					<a id="sidebar-sensors" class="sidebar-item hidden" data-section="sensors" href="#" onclick="showSection('sensors'); return false;">Sensors</a>
 				</nav>
 				<div class="dashboard-content">
@@ -749,10 +750,31 @@
 						</div>
 					</div>
 
-					<div id="section-sensors" class="hidden">
-						<div class="card">
-							<div class="section-header-flex">
-								<h2>Sensors</h2>
+				<div id="section-hostfw" class="hidden">
+					<div class="card">
+						<h2>Host Flash Update</h2>
+						<p style="color:#888;margin-bottom:15px;">Upload firmware image for USB-connected device via BMC.</p>
+						<div class="grid-4-col">
+							<div class="info-item">
+								<label for="hostfw-file">Select Firmware File</label>
+								<input type="file" id="hostfw-file">
+								<span class="helper-text">Raw binary or hex file</span>
+							</div>
+						</div>
+						<div class="controls-grid" style="margin-top:20px;">
+							<button id="hostfw-upload-btn" onclick="hostUpload()" style="background:#555;color:#fff;border:none;padding:8px 16px;border-radius:4px;cursor:pointer;">Upload to Device</button>
+							<button id="hostfw-cancel-btn" onclick="hostCancel()" style="background:#a33;color:#fff;border:none;padding:8px 16px;border-radius:4px;cursor:pointer;display:none;">Cancel</button>
+						</div>
+						<div id="hostfw-result" style="margin-top:15px;padding:15px;background:#1a1a2e;border-radius:8px;color:#aaa;">
+							No upload yet.
+						</div>
+					</div>
+				</div>
+
+				<div id="section-sensors" class="hidden">
+					<div class="card">
+						<div class="section-header-flex">
+							<h2>Sensors</h2>
 							</div>
 							<h3>BMC SoC Temperature</h3>
 							<div class="chart-container">
@@ -1317,7 +1339,7 @@
 		});
 
 		// --- Sidebar navigation ---
-		const SECTIONS = ['system-overview', 'host-console', 'bmc-shell', 'power-control', 'bmc', 'firmware', 'sensors'];
+		const SECTIONS = ['system-overview', 'host-console', 'bmc-shell', 'power-control', 'bmc', 'firmware', 'hostfw', 'sensors'];
 
 		function toggleSidebar() {
 			const sidebar = document.querySelector('.sidebar');
@@ -1664,6 +1686,83 @@
 			fwFile = null;
 			document.getElementById('fw-file').value = '';
 			document.getElementById('fw-file-info').innerText = 'No file selected';
+		}
+
+		function humanSize(bytes) {
+			if (bytes >= 1000000000) return (bytes / 1000000000).toFixed(2) + ' GB';
+			if (bytes >= 1000000) return (bytes / 1000000).toFixed(1) + ' MB';
+			if (bytes >= 1000) return (bytes / 1000).toFixed(0) + ' KB';
+			return bytes + ' B';
+		}
+
+		let hostfwXhr = null;
+
+		async function hostUpload() {
+			const input = document.getElementById('hostfw-file');
+			const result = document.getElementById('hostfw-result');
+			const btn = document.getElementById('hostfw-upload-btn');
+			const cancelBtn = document.getElementById('hostfw-cancel-btn');
+			if (!input.files.length) { result.innerText = 'Please select a file.'; return; }
+
+			if (hostfwXhr) { hostfwXhr.abort(); hostfwXhr = null; }
+			const file = input.files[0];
+			const total = file.size;
+			const t0 = performance.now();
+			btn.disabled = true;
+			cancelBtn.style.display = 'inline-block';
+
+			result.innerHTML = `Uploading ${humanSize(total)}...<br>` +
+				`<progress id="hostfw-progress" value="0" max="100" style="width:100%;height:20px;"></progress>` +
+				`<span id="hostfw-pct">0%</span>`;
+
+			try {
+				const xhr = new XMLHttpRequest();
+				hostfwXhr = xhr;
+				xhr.open('POST', '/api/hostfw/upload', true);
+				xhr.setRequestHeader('X-Auth-Code', basicAuthHeader);
+				xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+
+				xhr.upload.onprogress = function(e) {
+					if (e.lengthComputable) {
+						const pct = Math.round(e.loaded * 100 / e.total);
+						document.getElementById('hostfw-progress').value = pct;
+						document.getElementById('hostfw-pct').innerText = pct + '%';
+					}
+				};
+
+				await new Promise((resolve, reject) => {
+					xhr.onload = function() {
+						if (xhr.status === 200) resolve(xhr.responseText);
+						else reject(new Error('HTTP ' + xhr.status));
+					};
+					xhr.onerror = () => reject(new Error('Network error'));
+					xhr.onabort = () => reject(new Error('Cancelled'));
+					xhr.send(file);
+				});
+
+				const t1 = performance.now();
+				const elapsed = Math.round(t1 - t0);
+				const mbps = (total * 8 / elapsed / 1000).toFixed(2);
+				result.innerHTML += `<br><b>Upload complete</b><br>` +
+					`Size: ${humanSize(total)}<br>` +
+					`Time: ${elapsed} ms (${(elapsed/1000).toFixed(1)} s)<br>` +
+					`Throughput: ${mbps} Mbps`;
+			} catch (err) {
+				result.innerHTML = '<b>Error:</b> ' + err.message;
+			} finally {
+				btn.disabled = false;
+				cancelBtn.style.display = 'none';
+				hostfwXhr = null;
+			}
+		}
+
+		function hostCancel() {
+			document.getElementById('hostfw-cancel-btn').disabled = true;
+			document.getElementById('hostfw-cancel-btn').innerText = 'Cancelling...';
+			if (hostfwXhr) {
+				hostfwXhr.abort();
+				hostfwXhr = null;
+			}
 		}
 
 		populateFontSelects();
